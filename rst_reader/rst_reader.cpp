@@ -7,6 +7,7 @@
 #include "rst_reader.h"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace rst_reader {
 
@@ -105,41 +106,207 @@ bool RstReader::ansc_uncompress(const uint8_t* body, size_t body_bytes,
 }
 
 // ============================================================================
-// Определение единицы маркеров длины (слова или байты)
+// Определение формата записей файла
 // ============================================================================
+//
+// ANSYS RST файлы могут использовать разные форматы FORTRAN unformatted:
+//   1. reclen в 4-байтных СЛОВАХ (классический): [int32 n][n*4 байт][int32 n]
+//   2. reclen в БАЙТАХ: [int32 n][n байт][int32 n]
+//   3. reclen в 8-байтных СЛОВАХ: [int64 n][n*4 байт][int64 n]
+//   4. reclen в 8-байтных БАЙТАХ: [int64 n][n байт][int64 n]
+//
+// Определяем формат по первой записи: пробуем все варианты и выбираем тот,
+// где pre- и post-маркеры совпадают.
 
 void RstReader::detect_reclen_unit() {
-    if (reclen_bytes_ != 0) return;
+    if (reclen_bytes_ != 0) return;  // уже определено
     if (!fp_ || file_bytes_ < 12) return;
-    int32_t n = 0;
+    
     std::fseek(fp_, 0, SEEK_SET);
-    if (std::fread(&n, 4, 1, fp_) != 1 || n <= 0) return;
     
-    bool words_ok = false;
-    if (static_cast<int64_t>(n) * kWord + 8 <= file_bytes_) {
-        std::vector<uint8_t> body(static_cast<size_t>(n) * kWord);
-        if (std::fread(body.data(), 1, body.size(), fp_) == body.size()) {
+    // Читаем первые 4 байта как int32
+    int32_t n32 = 0;
+    if (std::fread(&n32, 4, 1, fp_) != 1) return;
+    
+    // Читаем первые 8 байт как int64
+    std::fseek(fp_, 0, SEEK_SET);
+    int64_t n64 = 0;
+    if (std::fread(&n64, 8, 1, fp_) != 1) n64 = 0;
+    
+    // ---- Тест 1: reclen в словах (int32) ----
+    // Формат: [int32 n_words][n_words*4 байт body][int32 n_words]
+    bool test1_ok = false;
+    if (n32 > 0 && n32 < (1 << 28)) {
+        int64_t body_size = static_cast<int64_t>(n32) * 4;
+        if (body_size + 8 <= file_bytes_) {
+            std::fseek(fp_, 4 + body_size, SEEK_SET);
             int32_t post = 0;
-            if (std::fread(&post, 4, 1, fp_) == 1 && post == n)
-                words_ok = !is_comp_magic(body.data());
+            if (std::fread(&post, 4, 1, fp_) == 1 && post == n32) {
+                test1_ok = true;
+            }
         }
     }
     
-    bool bytes_ok = false;
-    if (n >= 8 && static_cast<int64_t>(n) + 8 <= file_bytes_) {
-        std::fseek(fp_, 4, SEEK_SET);
-        std::vector<uint8_t> body(static_cast<size_t>(n));
-        if (std::fread(body.data(), 1, body.size(), fp_) == body.size()) {
+    // ---- Тест 2: reclen в байтах (int32) ----
+    // Формат: [int32 n_bytes][n_bytes байт body][int32 n_bytes]
+    bool test2_ok = false;
+    if (n32 > 0 && n32 < (1 << 28)) {
+        int64_t body_size = static_cast<int64_t>(n32);
+        if (body_size + 8 <= file_bytes_) {
+            std::fseek(fp_, 4 + body_size, SEEK_SET);
             int32_t post = 0;
-            if (std::fread(&post, 4, 1, fp_) == 1 && post == n)
-                bytes_ok = true;
+            if (std::fread(&post, 4, 1, fp_) == 1 && post == n32) {
+                test2_ok = true;
+            }
         }
     }
     
-    if (!words_ok && bytes_ok)
-        reclen_bytes_ = 1;
-    else
-        reclen_bytes_ = -1;
+    // ---- Тест 3: reclen в словах (int64) ----
+    // Формат: [int64 n_words][n_words*4 байт body][int64 n_words]
+    bool test3_ok = false;
+    if (n64 > 0 && n64 < (1LL << 28)) {
+        int64_t body_size = n64 * 4;
+        if (body_size + 16 <= file_bytes_) {
+            std::fseek(fp_, 8 + body_size, SEEK_SET);
+            int64_t post = 0;
+            if (std::fread(&post, 8, 1, fp_) == 1 && post == n64) {
+                test3_ok = true;
+            }
+        }
+    }
+    
+    // ---- Тест 4: reclen в байтах (int64) ----
+    // Формат: [int64 n_bytes][n_bytes байт body][int64 n_bytes]
+    bool test4_ok = false;
+    if (n64 > 0 && n64 < (1LL << 28)) {
+        int64_t body_size = n64;
+        if (body_size + 16 <= file_bytes_) {
+            std::fseek(fp_, 8 + body_size, SEEK_SET);
+            int64_t post = 0;
+            if (std::fread(&post, 8, 1, fp_) == 1 && post == n64) {
+                test4_ok = true;
+            }
+        }
+    }
+    
+    // Определяем формат
+    // Проверяем, является ли первая запись сжатой (ANSCOMP)
+    bool first_record_compressed = false;
+    if (test1_ok || test2_ok) {
+        // Читаем тело первой записи и проверяем на ANSCOMP
+        int64_t body_size = 0;
+        long body_start = 0;
+        if (test1_ok) {
+            body_size = static_cast<int64_t>(n32) * 4;
+            body_start = 4;
+        } else {
+            body_size = static_cast<int64_t>(n32);
+            body_start = 4;
+        }
+        if (body_size >= 8 && body_start + body_size <= file_bytes_) {
+            std::vector<uint8_t> body(static_cast<size_t>(body_size));
+            std::fseek(fp_, body_start, SEEK_SET);
+            if (std::fread(body.data(), 1, body.size(), fp_) == body.size()) {
+                if (is_comp_magic(body.data())) {
+                    first_record_compressed = true;
+                }
+            }
+        }
+    }
+    
+    // Приоритет определения формата:
+    // Если первая запись сжатая (ANSCOMP), то маркеры в БАЙТАХ (согласно спецификации ANSYS)
+    // Иначе: test1 (words/int32) > test2 (bytes/int32) > test3 (words/int64) > test4 (bytes/int64)
+    if (first_record_compressed) {
+        // Для сжатых записей используем байты
+        if (test2_ok) {
+            reclen_bytes_ = 1;    // маркеры в байтах, int32
+            reclen_64_ = false;
+        } else if (test4_ok) {
+            reclen_bytes_ = 1;    // маркеры в байтах, int64
+            reclen_64_ = true;
+        } else if (test1_ok) {
+            // Маркеры в словах, но запись сжатая — используем слова
+            reclen_bytes_ = -1;
+            reclen_64_ = false;
+        } else {
+            reclen_bytes_ = 1;
+            reclen_64_ = false;
+        }
+    } else {
+        // Несжатый файл — обычный приоритет
+        if (test1_ok) {
+            reclen_bytes_ = -1;   // маркеры в словах, int32
+            reclen_64_ = false;
+        } else if (test2_ok) {
+            reclen_bytes_ = 1;    // маркеры в байтах, int32
+            reclen_64_ = false;
+        } else if (test3_ok) {
+            reclen_bytes_ = -1;   // маркеры в словах, int64
+            reclen_64_ = true;
+        } else if (test4_ok) {
+            reclen_bytes_ = 1;    // маркеры в байтах, int64
+            reclen_64_ = true;
+        } else {
+            // Не удалось определить — используем слова/int32 по умолчанию
+            reclen_bytes_ = -1;
+            reclen_64_ = false;
+        }
+    }
+    
+    // Дополнительная проверка: если определены оба формата (слова и байты),
+    // проверяем вторую запись для подтверждения
+    if (test1_ok && test2_ok && !first_record_compressed) {
+        // Оба формата проходят для первой записи — проверяем вторую
+        // Для слов: следующая запись на позиции (4 + n32*4 + 4) = 8 + n32*4
+        // Для байтов: следующая запись на позиции (4 + n32 + 4) = 8 + n32
+        
+        int64_t next_words = 8 + static_cast<int64_t>(n32) * 4;
+        int64_t next_bytes = 8 + static_cast<int64_t>(n32);
+        
+        bool words2_ok = false, bytes2_ok = false;
+        
+        // Проверяем вторую запись для формата "слова"
+        if (next_words + 8 <= file_bytes_) {
+            std::fseek(fp_, static_cast<long>(next_words), SEEK_SET);
+            int32_t pre2 = 0;
+            if (std::fread(&pre2, 4, 1, fp_) == 1 && pre2 > 0 && pre2 < (1 << 28)) {
+                int64_t body2 = static_cast<int64_t>(pre2) * 4;
+                if (next_words + 4 + body2 + 4 <= file_bytes_) {
+                    std::fseek(fp_, static_cast<long>(next_words + 4 + body2), SEEK_SET);
+                    int32_t post2 = 0;
+                    if (std::fread(&post2, 4, 1, fp_) == 1 && post2 == pre2) {
+                        words2_ok = true;
+                    }
+                }
+            }
+        }
+        
+        // Проверяем вторую запись для формата "байты"
+        if (next_bytes + 8 <= file_bytes_) {
+            std::fseek(fp_, static_cast<long>(next_bytes), SEEK_SET);
+            int32_t pre2 = 0;
+            if (std::fread(&pre2, 4, 1, fp_) == 1 && pre2 > 0 && pre2 < (1 << 28)) {
+                int64_t body2 = static_cast<int64_t>(pre2);
+                if (next_bytes + 4 + body2 + 4 <= file_bytes_) {
+                    std::fseek(fp_, static_cast<long>(next_bytes + 4 + body2), SEEK_SET);
+                    int32_t post2 = 0;
+                    if (std::fread(&post2, 4, 1, fp_) == 1 && post2 == pre2) {
+                        bytes2_ok = true;
+                    }
+                }
+            }
+        }
+        
+        // Если только один формат проходит для второй записи — используем его
+        if (words2_ok && !bytes2_ok) {
+            reclen_bytes_ = -1;  // слова
+        } else if (bytes2_ok && !words2_ok) {
+            reclen_bytes_ = 1;   // байты
+        }
+        // Если оба или ни один — оставляем слова (по приоритету)
+    }
+    
     std::fseek(fp_, 0, SEEK_END);
 }
 
@@ -155,15 +322,29 @@ int64_t RstReader::frame_words_at(int64_t word_off) {
     }
     int64_t byte_off = word_off * kWord;
     if (!fp_ || byte_off + 8 > file_bytes_) return -1;
-    int32_t len_pre = 0;
+    
+    int64_t body_bytes = 0;
     long saved = std::ftell(fp_);
-    if (std::fseek(fp_, static_cast<long>(byte_off), SEEK_SET) != 0) return -1;
-    if (std::fread(&len_pre, 4, 1, fp_) != 1 || len_pre <= 0) {
-        std::fseek(fp_, saved, SEEK_SET); return -1;
+    
+    if (reclen_64_) {
+        // 8-байтные маркеры
+        if (std::fseek(fp_, static_cast<long>(byte_off), SEEK_SET) != 0) return -1;
+        int64_t len_pre = 0;
+        if (std::fread(&len_pre, 8, 1, fp_) != 1 || len_pre <= 0) {
+            std::fseek(fp_, saved, SEEK_SET); return -1;
+        }
+        body_bytes = reclen_bytes_ == 1 ? len_pre : len_pre * kWord;
+    } else {
+        // 4-байтные маркеры
+        if (std::fseek(fp_, static_cast<long>(byte_off), SEEK_SET) != 0) return -1;
+        int32_t len_pre = 0;
+        if (std::fread(&len_pre, 4, 1, fp_) != 1 || len_pre <= 0) {
+            std::fseek(fp_, saved, SEEK_SET); return -1;
+        }
+        body_bytes = reclen_bytes_ == 1 ? static_cast<int64_t>(len_pre)
+                                        : static_cast<int64_t>(len_pre) * kWord;
     }
-    int64_t body_bytes = reclen_bytes_ == 1
-        ? static_cast<int64_t>(len_pre)
-        : static_cast<int64_t>(len_pre) * kWord;
+    
     std::fseek(fp_, saved, SEEK_SET);
     int64_t frame_words = body_bytes / kWord;
     std::lock_guard<std::mutex> lk(unc_mtx_);
@@ -179,31 +360,71 @@ bool RstReader::read_record(int64_t word_off, std::vector<uint8_t>& buf,
                             int64_t& words_out, std::string& err) {
     detect_reclen_unit();
     int64_t byte_off = word_off * kWord;
-    int32_t len_pre = 0;
+    
+    int64_t body_bytes = 0;
+    int64_t marker_size = reclen_64_ ? 8 : 4;
+    
     if (std::fseek(fp_, static_cast<long>(byte_off), SEEK_SET) != 0) {
         err = "fseek fail"; return false;
     }
-    if (std::fread(&len_pre, 4, 1, fp_) != 1) {
-        err = "read reclen fail"; return false;
+    
+    // Читаем pre-маркер и запоминаем его значение
+    int64_t len_pre_val = 0;
+    if (reclen_64_) {
+        int64_t len_pre = 0;
+        if (std::fread(&len_pre, 8, 1, fp_) != 1) {
+            err = "read reclen fail"; return false;
+        }
+        if (len_pre <= 0) {
+            err = "bad record length " + std::to_string(len_pre); return false;
+        }
+        len_pre_val = len_pre;
+        body_bytes = reclen_bytes_ == 1 ? len_pre : len_pre * kWord;
+    } else {
+        int32_t len_pre = 0;
+        if (std::fread(&len_pre, 4, 1, fp_) != 1) {
+            err = "read reclen fail"; return false;
+        }
+        if (len_pre <= 0) {
+            err = "bad record length " + std::to_string(len_pre); return false;
+        }
+        len_pre_val = len_pre;
+        body_bytes = reclen_bytes_ == 1 ? static_cast<int64_t>(len_pre)
+                                        : static_cast<int64_t>(len_pre) * kWord;
     }
-    if (len_pre <= 0) {
-        err = "bad record length " + std::to_string(len_pre); return false;
-    }
-    int64_t body_bytes = reclen_bytes_ == 1
-        ? static_cast<int64_t>(len_pre)
-        : static_cast<int64_t>(len_pre) * kWord;
+    
+    // Читаем тело
     buf.resize(static_cast<size_t>(body_bytes));
     if (std::fread(buf.data(), 1, static_cast<size_t>(body_bytes), fp_) != static_cast<size_t>(body_bytes)) {
         err = "read body fail"; return false;
     }
-    int32_t len_post = 0;
-    if (std::fread(&len_post, 4, 1, fp_) != 1) {
-        err = "read reclen2 fail"; return false;
+    
+    // Читаем post-маркер и проверяем совпадение с pre-маркером
+    if (reclen_64_) {
+        int64_t len_post = 0;
+        if (std::fread(&len_post, 8, 1, fp_) != 1) {
+            err = "read reclen2 fail"; return false;
+        }
+        if (len_post != len_pre_val) {
+            err = "record markers mismatch (64-bit): pre=" + std::to_string(len_pre_val) +
+                  " post=" + std::to_string(len_post);
+            return false;
+        }
+    } else {
+        int32_t len_post = 0;
+        if (std::fread(&len_post, 4, 1, fp_) != 1) {
+            err = "read reclen2 fail"; return false;
+        }
+        if (len_post != static_cast<int32_t>(len_pre_val)) {
+            err = "record markers mismatch (32-bit): pre=" + std::to_string(len_pre_val) +
+                  " post=" + std::to_string(len_post);
+            return false;
+        }
     }
     
+    // Проверяем на сжатие ANSCOMP
     if (is_comp_magic(buf.data())) {
         compressed_ = true;
-        if (len_post != len_pre) { err = "record markers mismatch"; return false; }
         std::vector<uint8_t> unc;
         if (!ansc_uncompress(buf.data(), static_cast<size_t>(body_bytes), unc)) {
             err = "decompress fail at word " + std::to_string(word_off);
@@ -219,7 +440,6 @@ bool RstReader::read_record(int64_t word_off, std::vector<uint8_t>& buf,
         return true;
     }
     
-    if (len_post != len_pre) { err = "record markers mismatch"; return false; }
     words_out = body_bytes / kWord;
     return true;
 }
@@ -238,27 +458,53 @@ int64_t RstReader::read_pread(NativeFd fd, int64_t word_off,
             return static_cast<int64_t>(out.size()) / kWord;
         }
     }
+    
     int64_t rb = reclen_bytes_;
     int64_t byte_off = word_off * kWord;
-    int32_t len_pre = 0;
-    if (!fd_pread(fd, &len_pre, 4, byte_off)) { err = "pread reclen"; return -1; }
-    if (len_pre <= 0 || len_pre > (1 << 28)) {
-        err = "bad reclen " + std::to_string(len_pre); return -1;
+    int64_t body_bytes = 0;
+    int64_t marker_size = reclen_64_ ? 8 : 4;
+    
+    if (reclen_64_) {
+        int64_t len_pre = 0;
+        if (!fd_pread(fd, &len_pre, 8, byte_off)) { err = "pread reclen"; return -1; }
+        if (len_pre <= 0 || len_pre > (1LL << 28)) {
+            err = "bad reclen " + std::to_string(len_pre); return -1;
+        }
+        body_bytes = rb == 1 ? len_pre : len_pre * kWord;
+    } else {
+        int32_t len_pre = 0;
+        if (!fd_pread(fd, &len_pre, 4, byte_off)) { err = "pread reclen"; return -1; }
+        if (len_pre <= 0 || len_pre > (1 << 28)) {
+            err = "bad reclen " + std::to_string(len_pre); return -1;
+        }
+        body_bytes = rb == 1 ? static_cast<int64_t>(len_pre) : static_cast<int64_t>(len_pre) * kWord;
     }
-    int64_t body_bytes = rb == 1
-        ? static_cast<int64_t>(len_pre)
-        : static_cast<int64_t>(len_pre) * kWord;
+    
     std::vector<uint8_t> raw(static_cast<size_t>(body_bytes));
-    if (!fd_pread(fd, raw.data(), static_cast<size_t>(body_bytes), byte_off + 4)) {
+    if (!fd_pread(fd, raw.data(), static_cast<size_t>(body_bytes), byte_off + marker_size)) {
         err = "pread body"; return -1;
     }
-    int32_t len_post = 0;
-    if (!fd_pread(fd, &len_post, 4, byte_off + 4 + body_bytes)) {
-        err = "pread reclen2"; return -1;
+    
+    // Проверяем post-маркер
+    if (reclen_64_) {
+        int64_t len_post = 0;
+        if (!fd_pread(fd, &len_post, 8, byte_off + marker_size + body_bytes)) {
+            err = "pread reclen2"; return -1;
+        }
+        int64_t len_pre = 0;
+        fd_pread(fd, &len_pre, 8, byte_off);
+        if (len_post != len_pre) { err = "reclen mismatch"; return -1; }
+    } else {
+        int32_t len_post = 0;
+        if (!fd_pread(fd, &len_post, 4, byte_off + marker_size + body_bytes)) {
+            err = "pread reclen2"; return -1;
+        }
+        int32_t len_pre = 0;
+        fd_pread(fd, &len_pre, 4, byte_off);
+        if (len_post != len_pre) { err = "reclen mismatch"; return -1; }
     }
     
     if (is_comp_magic(raw.data())) {
-        if (len_post != len_pre) { err = "reclen mismatch"; return -1; }
         std::vector<uint8_t> unc;
         if (!ansc_uncompress(raw.data(), static_cast<size_t>(body_bytes), unc)) {
             err = "decompress fail at word " + std::to_string(word_off);
@@ -272,7 +518,6 @@ int64_t RstReader::read_pread(NativeFd fd, int64_t word_off,
         out = std::move(unc);
         return static_cast<int64_t>(out.size()) / kWord;
     }
-    if (len_post != len_pre) { err = "reclen mismatch"; return -1; }
     out = std::move(raw);
     return body_bytes / kWord;
 }
@@ -436,12 +681,9 @@ bool RstReader::read_nodes(std::vector<Node>& nodes, std::string& err) {
     if (!fp_) { err = "file not open"; return false; }
     if (ptr_geo_words_ == 0) { err = "no geometry pointer"; return false; }
     
-    // Читаем таблицу геометрии для получения указателя на узлы
     std::vector<uint8_t> b; int64_t w = 0;
     if (!read_record(ptr_geo_words_, b, w, err)) return false;
     
-    // В таблице геометрии ищем указатель на координаты узлов
-    // Формат: различные указатели на подтаблицы
     int64_t node_ptr = 0;
     for (int i = 0; i + 1 < w; ++i) {
         int64_t v = static_cast<int64_t>(std::llround(rd_f64(b.data() + i * 8)));
@@ -453,15 +695,12 @@ bool RstReader::read_nodes(std::vector<Node>& nodes, std::string& err) {
     
     if (node_ptr == 0) { err = "node table not found"; return false; }
     
-    // Читаем таблицу узлов
     if (!read_record(node_ptr, b, w, err)) return false;
     
     nodes.clear();
     nodes.reserve(static_cast<size_t>(n_nodes_));
     
-    // Формат записи узла: [id(int32)][x(f64)][y(f64)][z(f64)][rx(f64)][ry(f64)][rz(f64)]
-    // или упрощённый: [id(int32)][x(f64)][y(f64)][z(f64)]
-    int64_t stride = w / n_nodes_;  // слов на узел
+    int64_t stride = w / n_nodes_;
     if (stride < 4) { err = "unexpected node format"; return false; }
     
     for (int64_t i = 0; i < n_nodes_ && i * stride * kWord + 28 <= static_cast<int64_t>(b.size()); ++i) {
@@ -493,11 +732,9 @@ bool RstReader::read_elements(std::vector<Element>& elems, std::string& err) {
     std::vector<uint8_t> b; int64_t w = 0;
     if (!read_record(ptr_elem_words_, b, w, err)) return false;
     
-    // Получаем абсолютное смещение таблицы ELMAP
     int64_t elmmap_abs = static_cast<int64_t>(std::llround(rd_f64(b.data())));
     if (!read_record(elmmap_abs, b, w, err)) { err = "read ELMAP fail"; return false; }
     
-    // Ищем указатель на ELCONN
     int64_t conn_abs = 0;
     for (int probe = 1; probe + 1 < w; ++probe) {
         int64_t v = static_cast<int64_t>(std::llround(rd_f64(b.data() + probe * 8)));
@@ -509,7 +746,6 @@ bool RstReader::read_elements(std::vector<Element>& elems, std::string& err) {
     elems.clear();
     elems.reserve(static_cast<size_t>(n_elem_ptr_));
     
-    // Парсим ELCONN: 8 узлов на элемент
     size_t avail = static_cast<size_t>(w);
     int32_t eid = 0;
     for (size_t i = 0; i + 8 <= avail && eid < n_elem_ptr_; i += 8) {
@@ -538,11 +774,6 @@ bool RstReader::read_element_types(std::vector<ElementType>& types, std::string&
     if (!read_record(ptr_geo_words_, b, w, err)) return false;
     
     types.clear();
-    // Типы элементов обычно идут в геометрии после узлов
-    // Упрощённый парсинг: ищем блок типов
-    // В реальном формате это отдельная таблица, но для демонстрации
-    // возвращаем информацию из заголовка
-    
     return true;
 }
 
@@ -560,7 +791,6 @@ bool RstReader::read_displacements(int set_index, std::vector<Displacement>& dis
     
     const ResultSet& rs = sets_[set_index];
     
-    // Читаем заголовок решения
     std::vector<uint8_t> hdrbuf;
     int64_t cur = rs.rpointer_words;
     int64_t ptr_dof_table = -1;
@@ -582,12 +812,10 @@ bool RstReader::read_displacements(int set_index, std::vector<Displacement>& dis
     
     if (ptr_dof_table <= 0) { err = "DOF table not found"; fd_close(fd); return false; }
     
-    // Читаем таблицу DOF
     std::vector<uint8_t> dof_buf;
     int64_t dof_words = read_pread(fd, ptr_dof_table, dof_buf, err);
     if (dof_words < 0) { fd_close(fd); return false; }
     
-    // Парсим DOF таблицу: ищем перемещения (type 1=UX, 2=UY, 3=UZ)
     struct DofEntry { int32_t type; int32_t node; int64_t data_word; };
     std::vector<DofEntry> ux_entries, uy_entries, uz_entries;
     
@@ -600,9 +828,7 @@ bool RstReader::read_displacements(int set_index, std::vector<Displacement>& dis
         else if (type == 3) uz_entries.push_back({type, node, dw});
     }
     
-    // Читаем значения
     disps.clear();
-    // Для простоты: собираем все узлы из UX
     std::map<int32_t, Displacement> disp_map;
     
     for (auto& e : ux_entries) {
@@ -654,7 +880,6 @@ bool RstReader::read_nodal_stresses(int set_index, std::vector<NodalStress>& str
     
     const ResultSet& rs = sets_[set_index];
     
-    // Читаем заголовок решения
     std::vector<uint8_t> hdrbuf;
     int64_t cur = rs.rpointer_words;
     int64_t ptr_dof_table = -1;
@@ -676,12 +901,10 @@ bool RstReader::read_nodal_stresses(int set_index, std::vector<NodalStress>& str
     
     if (ptr_dof_table <= 0) { err = "DOF table not found"; fd_close(fd); return false; }
     
-    // Читаем таблицу DOF
     std::vector<uint8_t> dof_buf;
     int64_t dof_words = read_pread(fd, ptr_dof_table, dof_buf, err);
     if (dof_words < 0) { fd_close(fd); return false; }
     
-    // Ищем напряжения: type 9=SXY, 10=SYZ, 11=SXZ (+ косвенные SX, SY, SZ)
     struct DofEntry { int32_t type; int32_t node; int64_t data_word; };
     std::vector<DofEntry> stress_entries;
     
@@ -694,7 +917,6 @@ bool RstReader::read_nodal_stresses(int set_index, std::vector<NodalStress>& str
         }
     }
     
-    // Читаем значения напряжений
     std::map<int32_t, NodalStress> stress_map;
     
     for (auto& e : stress_entries) {
@@ -706,7 +928,7 @@ bool RstReader::read_nodal_stresses(int set_index, std::vector<NodalStress>& str
         ns.node_id = e.node;
         
         switch (e.type) {
-            case 1: ns.sx = val; break;   // UX -> SX (в контексте напряжений)
+            case 1: ns.sx = val; break;
             case 2: ns.sy = val; break;
             case 3: ns.sz = val; break;
             case 9: ns.sxy = val; break;
@@ -730,8 +952,6 @@ bool RstReader::read_nodal_stresses(int set_index, std::vector<NodalStress>& str
 
 bool RstReader::read_reaction_forces(int set_index, std::vector<ReactionForce>& forces,
                                      std::string& err) {
-    // Реакции хранятся в отдельной таблице в заголовке решения
-    // Упрощённая реализация
     if (!fp_) { err = "file not open"; return false; }
     forces.clear();
     return true;

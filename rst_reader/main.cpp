@@ -33,6 +33,7 @@
 #include <vector>
 #include <algorithm>
 #include <set>
+#include <cstdint>
 
 using namespace rst_reader;
 
@@ -286,6 +287,59 @@ int main(int argc, char** argv) {
     std::string err;
     if (!reader.open(rst_path, err)) {
         std::fprintf(stderr, "Ошибка открытия RST: %s\n", err.c_str());
+        std::fprintf(stderr, "\nДиагностика формата файла:\n");
+        
+        // Выводим информацию о файле для диагностики
+        FILE* f = std::fopen(rst_path.c_str(), "rb");
+        if (f) {
+            std::fseek(f, 0, SEEK_END);
+            long fsize = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            std::fprintf(stderr, "  Размер файла: %ld байт\n", fsize);
+            
+            // Читаем первые 32 байта
+            uint8_t header[32] = {};
+            size_t nread = std::fread(header, 1, 32, f);
+            std::fprintf(stderr, "  Первые %zu байт (hex): ", nread);
+            for (size_t i = 0; i < nread && i < 32; ++i)
+                std::fprintf(stderr, "%02x ", header[i]);
+            std::fprintf(stderr, "\n");
+            
+            // Пробуем разные интерпретации
+            int32_t n32 = 0;
+            std::memcpy(&n32, header, 4);
+            std::fprintf(stderr, "  int32 @0: %d (0x%08x)\n", n32, n32);
+            
+            int64_t n64 = 0;
+            std::memcpy(&n64, header, 8);
+            std::fprintf(stderr, "  int64 @0: %lld (0x%016llx)\n", (long long)n64, (long long)n64);
+            
+            // Проверяем маркеры для разных форматов
+            if (n32 > 0 && n32 < (1 << 28)) {
+                // Слова
+                long body_pos = 4 + (long)n32 * 4;
+                if (body_pos + 4 <= fsize) {
+                    std::fseek(f, body_pos, SEEK_SET);
+                    int32_t post = 0;
+                    std::fread(&post, 4, 1, f);
+                    std::fprintf(stderr, "  Формат [слова/int32]: pre=%d, post=%d, совпадение=%s\n",
+                                n32, post, n32 == post ? "ДА" : "НЕТ");
+                }
+                // Байты
+                body_pos = 4 + n32;
+                if (body_pos + 4 <= fsize) {
+                    std::fseek(f, body_pos, SEEK_SET);
+                    int32_t post = 0;
+                    std::fread(&post, 4, 1, f);
+                    std::fprintf(stderr, "  Формат [байты/int32]: pre=%d, post=%d, совпадение=%s\n",
+                                n32, post, n32 == post ? "ДА" : "НЕТ");
+                }
+            }
+            
+            std::fclose(f);
+        }
+        
+        std::fprintf(stderr, "\nПопробуйте запустить analyze_rst.py для подробного анализа.\n");
         return 1;
     }
     
