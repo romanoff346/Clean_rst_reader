@@ -1,0 +1,174 @@
+# ANSYS RST Reader
+
+Программа для чтения файлов результатов ANSYS MAPDL (`.rst` / `.rnn`) **без использования ANSYS**.
+
+## Описание
+
+Реализован прямой бинарный парсинг формата **FORTRAN unformatted sequential** (little-endian, double precision). Подход аналогичен:
+- `ResRdDemo.F` — Fortran-демо, использующий `binlib.dll` (ANSYS API)
+- `MultiModelReader/cpp` — C++ реализация прямого парсинга
+
+Но данная программа написана с нуля и не требует внешних библиотек (кроме стандартной C++ библиотеки).
+
+## Возможности
+
+- ✅ Чтение метаданных файла (заголовки, наборы результатов)
+- ✅ Поддержка **сжатых** записей ANSCOMP (формат DEFLATE, `OUTRES,...,,ANSYS`)
+- ✅ Поддержка **несжатых** записей (`OUTRES,...,NOCOMPRESS`)
+- ✅ Чтение координат узлов
+- ✅ Чтение связности элементов
+- ✅ Чтение Name Selections (компонентов)
+- ✅ Чтение перемещений (UX, UY, UZ)
+- ✅ Чтение узловых напряжений (SX, SY, SZ, SXY, SYZ, SXZ)
+- ✅ Вычисление напряжений Мизеса (von Mises)
+- ✅ Фильтрация по Name Selection
+- ✅ Экспорт в CSV
+- ✅ Кроссплатформенность (Linux / Windows)
+
+## Формат RST файла
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  FORTRAN Record 1: Указатели на таблицы заголовка       │
+│  [PTRPTR][PTRDAT][PRSOL][PTRGEO][PTRELM][PTRCMS]       │
+├─────────────────────────────────────────────────────────┤
+│  PTRDAT: Таблица данных (Glbnnod, Maxcomp, ...)         │
+├─────────────────────────────────────────────────────────┤
+│  PRSOL: Таблица решений (Nsets, RPNTR, TPRNT3D)        │
+├─────────────────────────────────────────────────────────┤
+│  RPNTR: Указатели на заголовки решений                  │
+├─────────────────────────────────────────────────────────┤
+│  TPRNT3D: Step/Substep/Time каждого набора              │
+├─────────────────────────────────────────────────────────┤
+│  PTRGEO: Геометрия (узлы, типы элементов)               │
+├─────────────────────────────────────────────────────────┤
+│  PTRELM: Таблица элементов (ELMAP, ELCONN)              │
+├─────────────────────────────────────────────────────────┤
+│  PTRCMS: Name Selections (компоненты)                   │
+├─────────────────────────────────────────────────────────┤
+│  Для каждого набора результатов:                        │
+│    RSPEC → DOF Table → Data Arrays                      │
+└─────────────────────────────────────────────────────────┘
+```
+
+Каждая FORTRAN-запись на диске:
+```
+[int32 reclen][body ...][int32 reclen]
+```
+
+Для сжатых записей (ANSCOMP):
+```
+[int32 reclen]['ANS-' version][orig_len][nchunks][chunk_lens...][compressed data...][int32 reclen]
+```
+
+## Сборка
+
+### Linux (g++ / clang)
+```bash
+cd rst_reader
+make
+```
+
+### Windows (MinGW)
+```cmd
+cd rst_reader
+make WIN=1
+```
+
+### Требования
+- C++ компилятор с поддержкой C++20 (g++ >= 9, clang >= 12, MSVC 2019+)
+- Make (опционально, можно собрать вручную)
+
+### Ручная сборка
+```bash
+g++ -std=c++20 -O2 -Wall -I. -c rst_reader.cpp -o rst_reader.o
+g++ -std=c++20 -O2 -Wall -I. -c deflate.cpp -o deflate.o
+g++ -std=c++20 -O2 -Wall -I. -c main.cpp -o main.o
+g++ -std=c++20 -o rst_reader_demo rst_reader.o deflate.o main.o -pthread
+```
+
+## Использование
+
+```bash
+./rst_reader_demo <file.rst> [опции]
+```
+
+### Опции
+
+| Опция | Описание |
+|-------|----------|
+| `--list` | Показать информацию о файле (наборы, компоненты) |
+| `--set N` | Прочитать набор с индексом N (0-based) |
+| `--substep N` | Найти набор по номеру подшага |
+| `--nodes` | Вывести координаты узлов |
+| `--elements` | Вывести элементы |
+| `--displacements` | Вывести перемещения |
+| `--stresses` | Вывести узловые напряжения |
+| `--mises` | Добавить напряжения Мизеса |
+| `--component NAME` | Фильтр по Name Selection |
+| `--csv FILE` | Сохранить результат в CSV |
+
+### Примеры
+
+```bash
+# Информация о файле
+./rst_reader_demo model.rst --list
+
+# Узловые напряжения для первого набора
+./rst_reader_demo model.rst --set 0 --stresses --mises
+
+# Перемещения для определённого подшага
+./rst_reader_demo model.rst --substep 5 --displacements
+
+# Фильтрация по Name Selection + экспорт в CSV
+./rst_reader_demo model.rst --set 0 --stresses --component FIX_NODES --mises --csv output.csv
+
+# Координаты узлов и элементы
+./rst_reader_demo model.rst --nodes --elements
+```
+
+## Архитектура
+
+```
+rst_reader/
+├── rst_reader.h      — заголовочный файл (структуры данных, API)
+├── rst_reader.cpp    — реализация ридера (парсинг RST, чтение данных)
+├── deflate.cpp       — DEFLATE декодер (RFC 1951 + zlib обёртка)
+├── main.cpp          — демонстрационная программа (CLI)
+├── Makefile          — скрипт сборки
+└── README.md         — документация
+```
+
+### Ключевые классы
+
+- **`RstReader`** — основной класс ридера. Открывает файл, читает метаданные, предоставляет API для чтения геометрии и результатов.
+- **`deflate::inflate_raw/inflate_zlib`** — минимальный DEFLATE декодер для распаковки сжатых записей ANSCOMP.
+
+### Подход к чтению
+
+1. **Открытие**: чтение первой записи → получение указателей на таблицы
+2. **Метаданные**: последовательное чтение таблиц данных, решений, компонентов
+3. **Результаты**: для каждого набора — чтение RSPEC → DOF Table → Data Arrays
+4. **Позиционный ввод**: `pread()` (Linux) / `ReadFile(OVERLAPPED)` (Windows) для потокобезопасного чтения
+
+## Сравнение с другими подходами
+
+| Характеристика | ResRdDemo.F (binlib.dll) | ansys-mapdl-reader (Python) | Данный ридер |
+|---|---|---|---|
+| Язык | Fortran | Python/Cython | C++ |
+| Зависимости | ANSYS DLL | pip пакет | Нет (только C++ std) |
+| Сжатые файлы | ✅ | ✅ | ✅ |
+| Скорость | Быстро | Средне | Быстро |
+| Параллелизм | Нет | Нет | Да (pread) |
+| Полный API | ✅ (ResRd*) | ✅ | Частичный |
+
+## Ссылки
+
+- [MultiModelReader](https://github.com/romanoff346/MultiModelReader) — исходный проект
+- [ANSYS RST Format](https://www.sharcnet.ca/Software/Ansys/) — документация ANSYS
+- [RFC 1951](https://tools.ietf.org/html/rfc1951) — DEFLATE формат
+- [RFC 1950](https://tools.ietf.org/html/rfc1950) — zlib формат
+
+## Лицензия
+
+Свободное использование. Программное обеспечение предоставляется "как есть", без гарантий.
