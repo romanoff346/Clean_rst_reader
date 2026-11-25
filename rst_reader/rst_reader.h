@@ -249,6 +249,7 @@ private:
     // Поддержка сжатых записей
     bool compressed_ = false;
     int64_t reclen_bytes_ = 0;    // 1 = байты, -1 = слова
+    bool reclen_64_ = false;      // true = 8-байтные маркеры (int64)
     int64_t nelem_hint_ = 0;
     
     // Кэш распакованных записей
